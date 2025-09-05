@@ -28,9 +28,24 @@
 #include <unistd.h>
 #include <time.h>
 
+#include <wiringPi.h>
+#include <stdbool.h>
+#include <string.h>
+#include <sys/stat.h>  // Required for realpath
+#include <sys/types.h>
+#include <linux/limits.h> // for PATH_MAX
+#include <pwd.h> // for pwu and 
+#include "IMU.h"
+
 #define WINDOW_WIDTH 1280
 #define WINDOW_HEIGHT 720
 #define WINDOW_RATIO WINDOW_WIDTH / WINDOW_HEIGHT
+
+#define DT 0.02 // [s/loop] loop period. 20ms
+#define AA 0.97 // complementary filter constant
+
+#define A_GAIN 0.0573 // [deg/LSB]
+#define G_GAIN 0.070  // [deg/s/LSB]
 
 /* -------------------------------------------------------------
  *  Simple quaternion utilities (no external libs)
@@ -169,10 +184,26 @@ static void cleanup(void)
     /* Insert real cleanup code here */
 }
 
+bool useSim = false;
+
 /* -------------------------------------------------------------
  *  Main program
  * ------------------------------------------------------------- */
-int main(void) {
+int main(int argc, char **argv) {
+
+    if(argc > 1){
+        for(int i=0; i < argc; i++){
+            printf("arg: %d = %s\n", i, argv[i]);
+            if(strcmp(argv[i], "-useSim") == 0){
+                if(strcmp(argv[i+1], "true") == 0){
+                    useSim = true;
+                } else {
+                    useSim = false;
+                }
+            }
+        }
+        
+    }
 
     struct sigaction sa;
 
@@ -191,6 +222,10 @@ int main(void) {
         perror("atexit");
         /* Not fatal – continue anyway */
     }
+    
+    /* ----- IMU setup ----- */
+    detectIMU();
+	enableIMU();
 
     /* ---------- X11 / GLX setup ---------- */
     Display *dpy = XOpenDisplay(NULL);
@@ -249,6 +284,21 @@ int main(void) {
     clock_gettime(CLOCK_MONOTONIC, &last_ts);
 
     quat orientation = {1.0, 0.0, 0.0, 0.0};   // identity quaternion
+    
+    int m_accRaw[3] = {0.0,0.0,0.0};
+    int m_gyrRaw[3] = {0.0,0.0,0.0};
+    int m_magRaw[3] = {0.0,0.0,0.0};
+    // imu calibration offsets
+    float m_gyroX_bias = 19.061001;
+    float m_gyroY_bias = -44.882000;
+    float m_gyroZ_bias = 39.209000;
+    float m_rate_gyr_x = 0.0;
+    float m_rate_gyr_y = 0.0;
+    float m_rate_gyr_z = 0.0;
+    float m_gyroXangle = 0.0;
+    float m_gyroYangle = 0.0;
+    float m_gyroZangle = 0.0;
+    
 
     while (!got_sigint) {
         /* ----- Handle X events ----- */
@@ -280,23 +330,58 @@ int main(void) {
                     (now.tv_nsec - last_ts.tv_nsec) * 1e-9;
         last_ts = now;
 
-        /* ----- Simulate IMU ----- */
-        double gyro[3], accel[3], mag[3];
-        double t = now.tv_sec + now.tv_nsec * 1e-9;
-        simulate_imu(t, gyro, accel, mag);
-
-        /* Integrate gyro rates into quaternion.
-         * For small dt we can treat angular velocity as a rotation vector.
-         */
         double half_dt = 0.5 * dt;
-        quat delta = {
-            1.0,
-            gyro[0]*half_dt,
-            gyro[1]*half_dt,
-            gyro[2]*half_dt
-        };
-        orientation = quat_mul(orientation, delta);
-        quat_normalize(&orientation);
+        /* ----- Simulate IMU ----- */
+        if(useSim) {
+            double gyro[3], accel[3], mag[3];
+            double t = now.tv_sec + now.tv_nsec * 1e-9;
+            simulate_imu(t, gyro, accel, mag);
+
+            /* Integrate gyro rates into quaternion.
+             * For small dt we can treat angular velocity as a rotation vector.
+             */
+            
+            quat delta = {
+                1.0,
+                gyro[0]*half_dt,
+                gyro[1]*half_dt,
+                gyro[2]*half_dt
+            };
+            orientation = quat_mul(orientation, delta);
+            quat_normalize(&orientation);
+        } else {
+        
+            /* ----- read IMU ----- */
+            // Read raw gyro data
+            readACC(m_accRaw);
+            readGYR(m_gyrRaw);
+            readMAG(m_magRaw);
+            
+            m_rate_gyr_x = (m_gyrRaw[0] - m_gyroX_bias) * G_GAIN;
+			m_rate_gyr_y = (m_gyrRaw[1] - m_gyroY_bias) * G_GAIN;
+			m_rate_gyr_z = (m_gyrRaw[2] - m_gyroZ_bias) * G_GAIN;
+            
+            //printf("x: %.3f, y: %.3f, z: %.3f, \n", m_rate_gyr_x, m_rate_gyr_y, m_rate_gyr_z);
+            //printf("x: %d, y: %d, z: %d, \n", m_gyrRaw[0], m_gyrRaw[1], m_gyrRaw[2]);
+            printf("x: %.3f, y: %.3f, z: %.3f, \n", (m_gyrRaw[0] - m_gyroX_bias), (m_gyrRaw[1] - m_gyroY_bias), (m_gyrRaw[2] - m_gyroZ_bias));
+            
+            m_gyroXangle += m_rate_gyr_x * dt;
+			m_gyroYangle += m_rate_gyr_y * dt;
+			m_gyroZangle += m_rate_gyr_z * dt;
+
+			//data.roll_rate = m_gyroYangle;
+			//data.pitch_rate = m_gyroXangle;
+			//data.yaw_rate = m_gyroZangle;
+            
+            quat delta = {
+                1.0,
+                m_gyroXangle,
+                m_gyroYangle,
+                m_gyroZangle
+            };
+            orientation = quat_mul(orientation, delta);
+            quat_normalize(&orientation);
+        }
 
         /* ----- Render ----- */
         glClearColor(0.07f, 0.07f, 0.12f, 1.0f);
