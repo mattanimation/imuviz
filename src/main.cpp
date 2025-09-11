@@ -4,7 +4,7 @@
  *      gcc -Wall -O2 main.c -lX11 -lGL -lGLU -lm -o imuviz
  *
  *  Run:
- *      ./imuviz
+ *      ./imuviz -useSim true
  *
  *  This program opens an X11 window, creates an old‑style OpenGL context,
  *  draws a rotating wire‑frame cube whose orientation is driven by a
@@ -13,7 +13,7 @@
  *  Dependencies: libX11, libGL, libm (standard on Linux).
  */
 
-#define _GNU_SOURCE  // for M_PI
+//#define _GNU_SOURCE  // for M_PI
 #define _POSIX_C_SOURCE 199309L   /* for nanosleep */
 
 #include <X11/Xlib.h>
@@ -36,6 +36,7 @@
 #include <linux/limits.h> // for PATH_MAX
 #include <pwd.h> // for pwu and 
 #include "IMU.h"
+#include "MadgwickAHRS.h"
 
 #define WINDOW_WIDTH 1280
 #define WINDOW_HEIGHT 720
@@ -118,6 +119,88 @@ static void simulate_imu(double t, double gyro[3], double accel[3], double mag[3
     mag[2] = 0.5 + 0.05 * cos(t * 0.3);
 }
 
+/* ------------------------------------------------------------------
+ *  USER‑DEFINED SENSOR INTERFACE
+ *
+ *  Replace these stubs with the actual code you use to talk to the
+ *  BerryIMU (e.g., via I²C).  They must return the most recent sensor
+ *  reading in the units expected by the filter:
+ *
+ *      • Gyroscope : rad · s⁻¹
+ *      • Accelerometer : g (9.81 m s⁻²) – any consistent scale works
+ *      • Magnetometer : µT (or any consistent scale)
+ *
+ *  The functions should block until a fresh sample is available or
+ *  return the last cached value.
+ * ------------------------------------------------------------------ */
+//static bool read_gyro(float *gx, float *gy, float *gz)
+//{
+//    /* TODO: fill in real reading code */
+//    /* Example dummy data – stationary device */
+//    *gx = 0.0f; *gy = 0.0f; *gz = 0.0f;
+//    return true;            /* false => read error */
+//}
+
+//static bool read_accel(float *ax, float *ay, float *az)
+//{
+//    /* TODO: fill in real reading code */
+//    *ax = 0.0f; *ay = 0.0f; *az = 1.0f;   /* gravity pointing +Z */
+//    return true;
+//}
+
+//static bool read_mag(float *mx, float *my, float *mz)
+//{
+//    /* TODO: fill in real reading code */
+//    *mx = 0.2f; *my = 0.0f; *mz = 0.5f;   /* arbitrary Earth field */
+//    return true;
+//}
+
+/* ------------------------------------------------------------------
+ *  Helper: compute the angular distance (in degrees) between two
+ *          unit quaternions qA and qB.
+ *
+ *  The formula is:
+ *        θ = 2 * acos(|qA·qB|)
+ *  where "·" is the quaternion dot product.
+ *
+ *  The result is always the smallest rotation (0 – 180 deg).
+ * ------------------------------------------------------------------ */
+static float quat_angle_deg(const float qA[4], const float qB[4])
+{
+    /* Dot product (both quaternions should be normalized) */
+    float dot = qA[0]*qB[0] + qA[1]*qB[1] + qA[2]*qB[2] + qA[3]*qB[3];
+
+    /* Clamp to [-1,1] to avoid NaNs from rounding errors */
+    if (dot >  1.0f) dot =  1.0f;
+    if (dot < -1.0f) dot = -1.0f;
+
+    /* Absolute value makes the result invariant to sign flips */
+    dot = fabsf(dot);
+
+    /* Smallest rotation angle (radians) then convert to degrees */
+    float theta_rad = 2.0f * acosf(dot);
+    return theta_rad * (180.0f / (float)M_PI);
+}
+
+/* ------------------------------------------------------------------
+ *  look_at_compare()
+ *
+ *  Returns true if the angular distance between `current_q` and
+ *  `target_q` is less than or equal to `tolerance_deg`.
+ *
+ *  It also writes the computed angular distance to `out_angle_deg`
+ *  (if the pointer is non‑NULL) so you can log or display it.
+ * ------------------------------------------------------------------ */
+static bool look_at_compare(const float current_q[4],
+                            const float target_q[4],
+                            float tolerance_deg,
+                            float *out_angle_deg)
+{
+    float ang = quat_angle_deg(current_q, target_q);
+    if (out_angle_deg) *out_angle_deg = ang;
+    return (ang <= tolerance_deg);
+}
+
 /* -------------------------------------------------------------
  *  Rendering helpers
  * ------------------------------------------------------------- */
@@ -184,6 +267,48 @@ static void cleanup(void)
     /* Insert real cleanup code here */
 }
 
+
+void loadIMUCalibration(float *offsets, const char* path){
+
+    FILE *file = fopen(path, "r");
+    if (file == NULL) {
+        printf("Error opening file %s\n", path);
+        return;
+    }
+
+    char line[1024];
+    if (fgets(line, 1024, file) == NULL) {
+        printf("Error reading header row\n");
+        fclose(file);
+        return;
+    }
+
+    // Read the subsequent rows
+    while (fgets(line, 1024, file) != NULL) {
+        // Parse the values in the row
+        char *token = strtok(line, ",");
+        for (int i = 0; i < 15; i++) {
+            if (token == NULL) {
+                printf("Error parsing row: not enough values\n");
+                fclose(file);
+                return;
+            }
+            float offset;
+            if (sscanf(token, "%f", &offset) != 1) {
+                // handle error
+                printf("failed to parse value %d\n", i);
+            } else {
+                offsets[i] = offset;
+            }
+            token = strtok(NULL, ",");
+        }
+    }
+    printf("loaded imu calibration: %.4f %.4f %.4f \n", offsets[0], offsets[1], offsets[2]);
+
+    fclose(file);
+
+}
+
 bool useSim = false;
 
 /* -------------------------------------------------------------
@@ -224,6 +349,9 @@ int main(int argc, char **argv) {
     }
     
     /* ----- IMU setup ----- */
+    float imu_offsets[15] = {0.0,0.0,0.0, 0.0,0.0,0.0, 0.0,0.0,0.0, 0.0,0.0,0.0, 0.0,0.0,0.0};
+    loadIMUCalibration(imu_offsets, "/home/rktman/imu_calibration.csv");
+    
     detectIMU();
 	enableIMU();
 
@@ -285,19 +413,60 @@ int main(int argc, char **argv) {
 
     quat orientation = {1.0, 0.0, 0.0, 0.0};   // identity quaternion
     
-    int m_accRaw[3] = {0.0,0.0,0.0};
-    int m_gyrRaw[3] = {0.0,0.0,0.0};
-    int m_magRaw[3] = {0.0,0.0,0.0};
+    int m_accRaw[3] = {0, 0, 0};
+    int m_gyrRaw[3] = {0, 0, 0};
+    int m_magRaw[3] = {0, 0, 0};
     // imu calibration offsets
-    float m_gyroX_bias = 19.061001;
-    float m_gyroY_bias = -44.882000;
-    float m_gyroZ_bias = 39.209000;
+    float m_gyroX_bias = imu_offsets[0];
+    float m_gyroY_bias = imu_offsets[1];
+    float m_gyroZ_bias = imu_offsets[2];
     float m_rate_gyr_x = 0.0;
     float m_rate_gyr_y = 0.0;
     float m_rate_gyr_z = 0.0;
     float m_gyroXangle = 0.0;
     float m_gyroYangle = 0.0;
     float m_gyroZangle = 0.0;
+    
+    /* ----------------------------------------------------------------
+     * 1 Initialise the Madgwick filter.
+     *
+     *    • β (beta) controls the trade‑off between responsiveness and
+     *      smoothness. 0.1–0.3 works well for most hobby IMUs.
+     *    • Start with the identity quaternion (no rotation).
+     * ---------------------------------------------------------------- */
+    //const float beta = 0.2f;               // tweak as needed
+    //madgwick_init(beta, 1.0f, 0.0f, 0.0f, 0.0f);
+    Madgwick filter;
+    filter.begin(25);
+
+    /* ----------------------------------------------------------------
+     * 2️ Define a target orientation you want to compare against.
+     *
+     *    For illustration we use a 45deg rotation around the Z‑axis.
+     *    Quaternion for a rotation θ about axis (x,y,z) is:
+     *        q = [cos(θ/2), sin(θ/2)*x, sin(θ/2)*y, sin(θ/2)*z]
+     * ---------------------------------------------------------------- */
+    const float target_angle_rad = M_PI/4.0f;   // 45 deg
+    const float half = target_angle_rad/2.0f;
+    const float target_q[4] = {
+        cosf(half),          // w
+        0.0f,                // x
+        0.0f,                // y
+        sinf(half)           // z
+    };
+    
+    /* ----------------------------------------------------------------
+     * 3 Main acquisition / processing loop.
+     *
+     *    In a real embedded program you would likely run this at a
+     *    fixed rate (e.g., 200 Hz).  Here we simply use a constant
+     *    `dt` and sleep a bit to keep the demo readable.
+     * ---------------------------------------------------------------- */
+    //const float dt = 0.01f;               // 100 Hz sample period 
+    const float tolerance_deg = 10.0f;    // how close we consider “aligned”
+
+    printf("Starting IMU demo – press Ctrl‑C to stop.\n");
+    printf("Target orientation: 45° yaw (Z‑axis).\n\n");
     
 
     while (!got_sigint) {
@@ -373,13 +542,47 @@ int main(int argc, char **argv) {
 			//data.pitch_rate = m_gyroXangle;
 			//data.yaw_rate = m_gyroZangle;
             
-            quat delta = {
-                1.0,
-                m_gyroXangle,
-                m_gyroYangle,
-                m_gyroZangle
-            };
-            orientation = quat_mul(orientation, delta);
+            // Feed data to the filter
+            filter.update(
+                m_rate_gyr_x, m_rate_gyr_y, m_rate_gyr_z,
+                m_accRaw[0], m_accRaw[1], m_accRaw[2],
+                m_magRaw[0], m_magRaw[1], m_magRaw[2]
+            );
+            //madgwick_update(
+            //    m_rate_gyr_x, m_rate_gyr_y, m_rate_gyr_z,
+            //    m_accRaw[0], m_accRaw[1], m_accRaw[2],
+            //    m_magRaw[0], m_magRaw[1], m_magRaw[2],
+            //    dt
+            //);
+
+            // Pull out the current quaternion
+            float cur_q[4] = {filter.getQ0(), filter.getQ1(), filter.getQ2(), filter.getQ3()};
+            printf("p: %f, r: %f, y: %f\n", filter.getPitch(), filter.getRoll(), filter.getYaw());
+            //madgwick_get_quaternion(&cur_q[0], &cur_q[1], &cur_q[2], &cur_q[3]);
+
+            /* ---- Compare with the target orientation ------------------------ */
+            float angle_to_target;
+            bool aligned = look_at_compare(cur_q, target_q,
+                                          tolerance_deg, &angle_to_target);
+
+            /* ---- Print a concise status line -------------------------------- */
+            if(0){
+            printf("\rAngle to target: %6.2f°  |  %s \n",
+                   angle_to_target,
+                   aligned ? "ALIGNED   " : "not aligned");
+               }
+            
+            //quat delta = {
+            //    1.0,
+            //    m_gyroXangle,
+            //    m_gyroYangle,
+            //    m_gyroZangle
+            //};
+            //orientation = quat_mul(orientation, delta);
+            orientation.w = cur_q[0];
+            orientation.x = cur_q[1];
+            orientation.y = cur_q[2];
+            orientation.z = cur_q[3];
             quat_normalize(&orientation);
         }
 
